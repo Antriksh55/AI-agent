@@ -12,7 +12,7 @@ let genAI = null;
 let model = null;
 let isConfigured = false;
 
-function initGemini() {
+async function initGemini() {
   const key = process.env.GEMINI_API_KEY;
   if (!key || key === "your_gemini_api_key_here" || key.length < 20) {
     console.warn("  ⚠️  GEMINI_API_KEY not configured. AI will run in fallback mode.");
@@ -24,16 +24,43 @@ function initGemini() {
   try {
     const { GoogleGenerativeAI } = require("@google/generative-ai");
     genAI = new GoogleGenerativeAI(key);
-    model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    isConfigured = true;
-    console.log("  ✅ Gemini 1.5 Flash initialized");
+
+    // Try models in order of preference — auto-detect whichever is available
+    const candidates = [
+      "gemini-1.5-flash",
+      "gemini-2.5-flash",
+      "gemini-3.5-flash",
+      "gemini-3.8-flash",
+      "gemini-flash-latest",
+    ];
+
+    let initialized = false;
+    for (const modelName of candidates) {
+      try {
+        const candidate = genAI.getGenerativeModel({ model: modelName });
+        await candidate.generateContent("hi"); // lightweight probe
+        model = candidate;
+        isConfigured = true;
+        detectedModel = modelName;
+        console.log(`  ✅ Gemini initialized: ${modelName}`);
+        initialized = true;
+        break;
+      } catch {
+        // Try next
+      }
+    }
+
+    if (!initialized) {
+      console.warn("  ⚠️  No Gemini model responded. AI will run in fallback mode.");
+      isConfigured = false;
+    }
   } catch (err) {
     console.error("  ❌ Failed to initialize Gemini:", err.message);
     isConfigured = false;
   }
 }
 
-// Initialize on module load
+// Initialize on module load (async — errors are caught internally)
 initGemini();
 
 // ── System Prompt ─────────────────────────────────────────────────────────────
@@ -331,10 +358,12 @@ function buildMemoryContext(memory) {
   return facts.join("\n");
 }
 
+let detectedModel = null;
+
 function getStatus() {
   return {
     configured: isConfigured,
-    model: isConfigured ? "gemini-1.5-flash" : null,
+    model: detectedModel,
     fallbackMode: !isConfigured,
   };
 }
