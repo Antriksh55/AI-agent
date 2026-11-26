@@ -3,6 +3,8 @@
 .env.local
 .env.production
 .env.*.local
+.INTERVIEW_PREPARATION
+.PROJECT_REPORT
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 node_modules/
@@ -15,6 +17,10 @@ frontend/.vite/
 
 # ── Database files (contain customer data) ───────────────────────────────────
 backend/data/db/*.json
+
+# ── Private documents (kept locally, not on GitHub) ──────────────────────────
+INTERVIEW_PREPARATION.md
+PROJECT_REPORT.md
 
 # ── OS files ──────────────────────────────────────────────────────────────────
 .DS_Store
