@@ -1,37 +1,25 @@
 /**
- * RAG Service – Retrieval-Augmented Generation
- *
- * Implementation: Keyword-based TF-IDF similarity search (MVP fallback).
- *
- * ⚠️  IMPORTANT – This is NOT vector RAG.
- *     It uses term frequency × inverse document frequency to rank knowledge
- *     chunks by relevance to the query. This is an honest, clearly labelled
- *     keyword retrieval fallback.
- *
- * Production upgrade path:
- *   1. Call Gemini Embedding API (models/text-embedding-004) to get embeddings.
- *   2. Store vectors in a vector database (Pinecone, Weaviate, or pgvector).
- *   3. Replace rankChunks() with cosine similarity search against stored vectors.
- *   4. No other code changes needed — the interface stays the same.
+ * RAG Service – Keyword TF-IDF Retrieval (clearly labelled fallback)
+ * Fixed: smaller chunks, higher topK, category boost, better tokenization.
  */
 
 const { knowledgeDocuments } = require("../data/knowledgeBase");
 const db = require("./dbService");
 
-let chunks = []; // In-memory chunk index
+let chunks = [];
 
-// ── Chunking ──────────────────────────────────────────────────────────────────
+// ── Chunking — smaller size so short docs split properly ─────────────────────
 
-function chunkDocument(doc, chunkSize = 300, overlap = 50) {
+function chunkDocument(doc, chunkSize = 120, overlap = 25) {
   const words = doc.content.split(/\s+/);
   const result = [];
   let i = 0;
-  let chunkIndex = 0;
+  let idx = 0;
 
   while (i < words.length) {
     const slice = words.slice(i, i + chunkSize).join(" ");
     result.push({
-      id: `${doc.id}-chunk-${chunkIndex}`,
+      id: `${doc.id}-chunk-${idx}`,
       docId: doc.id,
       category: doc.category,
       title: doc.title,
@@ -39,33 +27,31 @@ function chunkDocument(doc, chunkSize = 300, overlap = 50) {
       wordCount: slice.split(/\s+/).length,
     });
     i += chunkSize - overlap;
-    chunkIndex++;
+    idx++;
   }
 
   return result;
 }
 
-// ── TF-IDF helpers ────────────────────────────────────────────────────────────
+// ── TF-IDF ────────────────────────────────────────────────────────────────────
 
 function tokenize(text) {
   return text
     .toLowerCase()
     .replace(/[^a-z0-9₹\s]/g, " ")
     .split(/\s+/)
-    .filter((t) => t.length > 2);
+    .filter((t) => t.length > 1); // was >2, now >1 to catch "ai", "id" etc.
 }
 
 function termFrequency(tokens, term) {
   const count = tokens.filter((t) => t === term).length;
-  return count / tokens.length;
+  return count / (tokens.length || 1);
 }
 
 function inverseDocumentFrequency(term, allDocs) {
-  const docsWithTerm = allDocs.filter((doc) =>
-    tokenize(doc.text).includes(term)
-  ).length;
+  const docsWithTerm = allDocs.filter((doc) => tokenize(doc.text).includes(term)).length;
   if (docsWithTerm === 0) return 0;
-  return Math.log(allDocs.length / docsWithTerm);
+  return Math.log((allDocs.length + 1) / (docsWithTerm + 1)) + 1; // smoothed IDF
 }
 
 function tfidfScore(queryTokens, chunk, allChunks) {
@@ -79,101 +65,87 @@ function tfidfScore(queryTokens, chunk, allChunks) {
   return score;
 }
 
-// ── Main retrieval ────────────────────────────────────────────────────────────
+// Category relevance boost — pricing/faq chunks get a boost for relevant queries
+const CATEGORY_KEYWORDS = {
+  pricing: ["price", "cost", "plan", "pricing", "rupee", "inr", "month", "starter", "professional", "enterprise", "affordable", "cheap", "fee", "charges", "kitna"],
+  faq:     ["how", "do", "you", "offer", "support", "trial", "refund", "cancel", "integrate", "work", "feature"],
+  products:["autoflow", "engageai", "datainsight", "automation", "chatbot", "dashboard", "workflow", "integration"],
+  "use-cases":["real estate", "education", "healthcare", "retail", "manufacturing", "finance"],
+};
 
-function rankChunks(query, topK = 4) {
+function categoryBoost(chunk, queryTokens) {
+  const relevantCategories = Object.entries(CATEGORY_KEYWORDS)
+    .filter(([, keywords]) => queryTokens.some((qt) => keywords.includes(qt)))
+    .map(([cat]) => cat);
+  return relevantCategories.includes(chunk.category) ? 0.3 : 0;
+}
+
+// ── Retrieve ──────────────────────────────────────────────────────────────────
+
+function rankChunks(query, topK = 6) {
   if (chunks.length === 0) return [];
-
   const queryTokens = tokenize(query);
   if (queryTokens.length === 0) return [];
 
   const scored = chunks.map((chunk) => ({
     chunk,
-    score: tfidfScore(queryTokens, chunk, chunks),
+    score: tfidfScore(queryTokens, chunk, chunks) + categoryBoost(chunk, queryTokens),
   }));
 
   scored.sort((a, b) => b.score - a.score);
 
-  // Return top-K chunks with score > 0
   return scored
     .filter((s) => s.score > 0)
     .slice(0, topK)
-    .map((s) => ({
-      ...s.chunk,
-      relevanceScore: parseFloat(s.score.toFixed(4)),
-    }));
+    .map((s) => ({ ...s.chunk, relevanceScore: parseFloat(s.score.toFixed(4)) }));
 }
 
-/**
- * Retrieve relevant context for a user query.
- * Returns a formatted string ready to inject into the LLM prompt.
- */
-function retrieve(query, topK = 4) {
+function retrieve(query, topK = 6) {
   const results = rankChunks(query, topK);
 
   if (results.length === 0) {
-    return {
-      context: "",
-      sources: [],
-      method: "keyword-tfidf",
-    };
+    return { context: "", sources: [], method: "keyword-tfidf" };
   }
 
-  const context = results
-    .map(
-      (r, i) =>
-        `[Source ${i + 1}: ${r.title} (${r.category})]\n${r.text}`
-    )
+  // Deduplicate by docId — prefer the highest-scoring chunk per document
+  const seen = new Set();
+  const deduped = results.filter((r) => {
+    if (seen.has(r.docId)) return false;
+    seen.add(r.docId);
+    return true;
+  });
+
+  const context = deduped
+    .map((r, i) => `[Source ${i + 1}: ${r.title}]\n${r.text}`)
     .join("\n\n---\n\n");
 
   return {
     context,
-    sources: results.map((r) => ({ id: r.docId, title: r.title, category: r.category })),
+    sources: deduped.map((r) => ({ id: r.docId, title: r.title, category: r.category })),
     method: "keyword-tfidf",
   };
 }
 
-// ── Load and index ────────────────────────────────────────────────────────────
+// ── Load ──────────────────────────────────────────────────────────────────────
 
 async function loadKnowledgeBase() {
-  // Load from built-in documents
   chunks = [];
   for (const doc of knowledgeDocuments) {
-    const docChunks = chunkDocument(doc);
-    chunks.push(...docChunks);
+    chunks.push(...chunkDocument(doc));
   }
-
-  // Also load any custom knowledge entries saved in the DB
   try {
     const customDocs = db.findAll("knowledge");
-    for (const doc of customDocs) {
-      const docChunks = chunkDocument(doc);
-      chunks.push(...docChunks);
-    }
-  } catch {
-    // DB may not have knowledge collection yet — ignore
-  }
+    for (const doc of customDocs) chunks.push(...chunkDocument(doc));
+  } catch { /* ignore */ }
 
-  console.log(
-    `  ✅ RAG index built: ${chunks.length} chunks from ${knowledgeDocuments.length} documents (method: keyword-tfidf)`
-  );
+  console.log(`  ✅ RAG index built: ${chunks.length} chunks from ${knowledgeDocuments.length} documents (method: keyword-tfidf)`);
 }
 
 function reloadChunk(doc) {
-  // Remove old chunks for this doc
   chunks = chunks.filter((c) => c.docId !== doc.id);
-  // Add new chunks
   chunks.push(...chunkDocument(doc));
 }
 
-function getAllDocuments() {
-  return knowledgeDocuments;
-}
+function getAllDocuments() { return knowledgeDocuments; }
 
-module.exports = {
-  retrieve,
-  loadKnowledgeBase,
-  reloadChunk,
-  getAllDocuments,
-  rankChunks,
-};
+module.exports = { retrieve, loadKnowledgeBase, reloadChunk, getAllDocuments, rankChunks };

@@ -14,6 +14,7 @@ const rateLimit = require("express-rate-limit");
 
 const { initDb } = require("./services/dbService");
 const { loadKnowledgeBase } = require("./services/ragService");
+const { initAI } = require("./services/aiService");
 
 // Routes
 const healthRoutes = require("./routes/health");
@@ -25,6 +26,7 @@ const knowledgeRoutes = require("./routes/knowledge");
 const analyticsRoutes = require("./routes/analytics");
 const summaryRoutes = require("./routes/summaries");
 const escalationRoutes = require("./routes/escalations");
+const tokenRoutes      = require("./routes/token");
 
 const { errorHandler } = require("./middleware/errorHandler");
 const { requestLogger } = require("./middleware/requestLogger");
@@ -79,6 +81,7 @@ app.use("/api/knowledge", knowledgeRoutes);
 app.use("/api/analytics", analyticsRoutes);
 app.use("/api/summaries", summaryRoutes);
 app.use("/api/escalations", escalationRoutes);
+app.use("/api/token",      tokenRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -93,11 +96,15 @@ async function start() {
   try {
     await initDb();
     await loadKnowledgeBase();
+
+    // Start server immediately — AI probes in background (non-blocking)
     app.listen(PORT, () => {
       console.log(`✅ NovaTech Sales Agent backend running on port ${PORT}`);
-      console.log(`   Gemini configured: ${!!process.env.GEMINI_API_KEY}`);
       console.log(`   Environment: ${process.env.NODE_ENV || "development"}`);
     });
+
+    // Probe AI provider after server is up (non-blocking)
+    initAI();
   } catch (err) {
     console.error("❌ Startup failed:", err.message);
     process.exit(1);
